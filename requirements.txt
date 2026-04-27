@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+openai
+yt-dlp
+pydantic
