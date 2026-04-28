@@ -8,19 +8,34 @@ from pydantic import BaseModel
 from openai import OpenAI
 
 app = FastAPI()
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+api_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+if not api_key:
+    raise RuntimeError("OPENAI_API_KEY manquante sur Railway")
+
+client = OpenAI(api_key=api_key)
+
 
 class VideoRequest(BaseModel):
     url: str
 
+
 @app.get("/")
 def health():
-    return {"ok": True, "service": "ugc-growth-video-worker"}
+    return {
+        "ok": True,
+        "service": "ugc-growth-video-worker"
+    }
+
 
 @app.post("/transcribe")
 def transcribe_video(payload: VideoRequest):
     if not payload.url:
-        raise HTTPException(status_code=400, detail="Missing url")
+        raise HTTPException(
+            status_code=400,
+            detail="Missing url"
+        )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_template = str(Path(tmpdir) / "audio.%(ext)s")
@@ -48,8 +63,13 @@ def transcribe_video(payload: VideoRequest):
 
             if not Path(audio_path).exists():
                 files = list(Path(tmpdir).glob("audio.*"))
+
                 if not files:
-                    raise HTTPException(status_code=500, detail="Audio extraction failed")
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Audio extraction failed"
+                    )
+
                 audio_path = str(files[0])
 
             with open(audio_path, "rb") as audio_file:
@@ -64,11 +84,19 @@ def transcribe_video(payload: VideoRequest):
             }
 
         except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="Video download timeout")
+            raise HTTPException(
+                status_code=504,
+                detail="Video download timeout"
+            )
+
         except subprocess.CalledProcessError as e:
             raise HTTPException(
                 status_code=500,
                 detail=f"yt-dlp failed: {e.stderr[-1000:] if e.stderr else 'unknown error'}",
             )
+
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(
+                status_code=500,
+                detail=str(e)
+            )
