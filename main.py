@@ -3,14 +3,13 @@ import tempfile
 import subprocess
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from openai import OpenAI
 
 app = FastAPI()
 
 api_key = os.getenv("OPENAI_API_KEY", "").strip()
-
 if not api_key:
     raise RuntimeError("OPENAI_API_KEY manquante sur Railway")
 
@@ -23,19 +22,13 @@ class VideoRequest(BaseModel):
 
 @app.get("/")
 def health():
-    return {
-        "ok": True,
-        "service": "ugc-growth-video-worker"
-    }
+    return {"ok": True, "service": "ugc-growth-video-worker"}
 
 
 @app.post("/transcribe")
 def transcribe_video(payload: VideoRequest):
     if not payload.url:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing url"
-        )
+        raise HTTPException(status_code=400, detail="Missing url")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_template = str(Path(tmpdir) / "audio.%(ext)s")
@@ -63,13 +56,8 @@ def transcribe_video(payload: VideoRequest):
 
             if not Path(audio_path).exists():
                 files = list(Path(tmpdir).glob("audio.*"))
-
                 if not files:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Audio extraction failed"
-                    )
-
+                    raise HTTPException(status_code=500, detail="Audio extraction failed")
                 audio_path = str(files[0])
 
             with open(audio_path, "rb") as audio_file:
@@ -78,25 +66,43 @@ def transcribe_video(payload: VideoRequest):
                     file=audio_file,
                 )
 
-            return {
-                "transcript": transcript.text,
-                "sourceUrl": payload.url,
-            }
+            return {"transcript": transcript.text, "sourceUrl": payload.url}
 
         except subprocess.TimeoutExpired:
-            raise HTTPException(
-                status_code=504,
-                detail="Video download timeout"
-            )
-
+            raise HTTPException(status_code=504, detail="Video download timeout")
         except subprocess.CalledProcessError as e:
             raise HTTPException(
                 status_code=500,
                 detail=f"yt-dlp failed: {e.stderr[-1000:] if e.stderr else 'unknown error'}",
             )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/upload-transcribe")
+async def upload_transcribe(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(status_code=400, detail="Missing file")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        safe_name = file.filename or "upload.mp4"
+        input_path = Path(tmpdir) / safe_name
+
+        try:
+            content = await file.read()
+            input_path.write_bytes(content)
+
+            with open(input_path, "rb") as uploaded_file:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=uploaded_file,
+                )
+
+            return {
+                "transcript": transcript.text,
+                "filename": safe_name,
+                "noStorage": True,
+            }
 
         except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=str(e)
-            )
+            raise HTTPException(status_code=500, detail=str(e))
