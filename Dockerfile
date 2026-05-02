@@ -19,6 +19,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir python-multipart
 
 # FORCE update yt-dlp (important pour YouTube)
 RUN pip install --no-cache-dir -U yt-dlp
