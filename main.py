@@ -24,6 +24,84 @@ if not api_key:
 
 client = OpenAI(api_key=api_key)
 
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+# Garde une marge sous la limite Whisper de 25 MiB.
+MAX_TRANSCRIPTION_BYTES = 24 * 1024 * 1024
+
+
+async def save_upload(upload: UploadFile, destination: Path):
+    with destination.open("wb") as output:
+        while True:
+            chunk = await upload.read(UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            output.write(chunk)
+
+
+def extract_audio_for_transcription(input_path: Path, tmpdir: str) -> Path:
+    output_path = Path(tmpdir) / "transcription-audio.mp3"
+
+    def encode(bitrate: str):
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-b:a",
+                bitrate,
+                str(output_path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=300,
+        )
+
+    try:
+        encode("48k")
+        if output_path.stat().st_size > MAX_TRANSCRIPTION_BYTES:
+            encode("24k")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Audio extraction timeout")
+    except subprocess.CalledProcessError as exc:
+        details = (exc.stderr or "unknown ffmpeg error")[-1200:]
+        raise HTTPException(
+            status_code=422,
+            detail=f"Audio extraction failed: {details}",
+        )
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise HTTPException(status_code=422, detail="Aucune piste audio exploitable")
+
+    if output_path.stat().st_size > MAX_TRANSCRIPTION_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Audio trop long apres compression pour une transcription unique",
+        )
+
+    return output_path
+
+
+def transcribe_uploaded_media(input_path: Path, tmpdir: str) -> str:
+    audio_path = extract_audio_for_transcription(input_path, tmpdir)
+
+    with audio_path.open("rb") as audio_file:
+        transcription = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+        )
+
+    return transcription.text or ""
+
 
 class VideoRequest(BaseModel):
     url: str
@@ -176,6 +254,34 @@ def transcribe_video(payload: VideoRequest):
             raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/upload-transcribe")
+async def upload_transcribe(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(status_code=400, detail="Missing file")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        safe_name = Path(file.filename or "upload.bin").name
+        input_path = Path(tmpdir) / safe_name
+
+        try:
+            await save_upload(file, input_path)
+            transcript = transcribe_uploaded_media(input_path, tmpdir)
+
+            if not transcript.strip():
+                raise HTTPException(status_code=422, detail="Transcript vide")
+
+            return {
+                "success": True,
+                "noStorage": True,
+                "filename": safe_name,
+                "transcript": transcript,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/upload-analyze")
 async def upload_analyze(
     file: UploadFile = File(...),
@@ -188,20 +294,12 @@ async def upload_analyze(
         raise HTTPException(status_code=400, detail="Missing file")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        safe_name = file.filename or "upload.mp4"
+        safe_name = Path(file.filename or "upload.bin").name
         input_path = Path(tmpdir) / safe_name
 
         try:
-            content = await file.read()
-            input_path.write_bytes(content)
-
-            with open(input_path, "rb") as uploaded_file:
-                transcription = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=uploaded_file,
-                )
-
-            transcript = transcription.text or ""
+            await save_upload(file, input_path)
+            transcript = transcribe_uploaded_media(input_path, tmpdir)
 
             if not transcript.strip():
                 raise HTTPException(status_code=422, detail="Transcript vide")
