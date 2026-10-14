@@ -193,6 +193,7 @@ def _probe_duration(video_path: Path) -> float:
 
 
 def _detect_scene_timestamps(video_path: Path, duration: float) -> list[float]:
+    # VISUAL_ENGINE_V12_COVERAGE
     scan_limit = min(duration or MAX_VISUAL_SECONDS, MAX_VISUAL_SECONDS)
     command = [
         "ffmpeg",
@@ -219,26 +220,56 @@ def _detect_scene_timestamps(video_path: Path, duration: float) -> list[float]:
             text=True,
             timeout=180,
         )
-        times = [
+        scene_times = [
             float(value)
             for value in re.findall(r"pts_time:([0-9]+(?:\.[0-9]+)?)", result.stderr or "")
         ]
     except Exception:
-        times = []
+        scene_times = []
 
     end = scan_limit if scan_limit > 0 else 30.0
-    candidates = [0.2]
-    candidates.extend(t for t in times if 0.2 <= t <= end)
+    if end <= 0.3:
+        return [max(0.0, end / 2)]
 
-    # Si le montage contient peu de coupes détectables, compléter par des échantillons
-    # temporels réels afin de couvrir le début, le milieu et la fin.
-    if len(candidates) < 5 and end > 1:
-        for fraction in (0.15, 0.35, 0.55, 0.75, 0.92):
-            candidates.append(max(0.2, min(end - 0.1, end * fraction)))
+    regular_count = min(
+        MAX_VISUAL_FRAMES,
+        max(5, int(end // 15.0) + 1),
+    )
 
-    # Dédupliquer les captures trop proches.
+    if regular_count <= 1:
+        anchors = [0.2]
+    else:
+        usable_end = max(0.2, end - 0.1)
+        span = max(0.0, usable_end - 0.2)
+        anchors = [
+            0.2 + (span * index / (regular_count - 1))
+            for index in range(regular_count)
+        ]
+
+    snap_window = max(1.5, min(5.0, end / max(regular_count * 3, 1)))
+    selected = []
+    for index, anchor in enumerate(anchors):
+        chosen = anchor
+        if 0 < index < len(anchors) - 1 and scene_times:
+            nearby = [
+                value
+                for value in scene_times
+                if 0.2 <= value <= end and abs(value - anchor) <= snap_window
+            ]
+            if nearby:
+                chosen = min(nearby, key=lambda value: abs(value - anchor))
+        selected.append(max(0.2, min(end - 0.1, chosen)))
+
+    for value in scene_times:
+        if len(selected) >= MAX_VISUAL_FRAMES:
+            break
+        if not (0.2 <= value <= end):
+            continue
+        if all(abs(value - existing) >= 1.25 for existing in selected):
+            selected.append(value)
+
     deduped = []
-    for value in sorted(candidates):
+    for value in sorted(selected):
         if not deduped or abs(value - deduped[-1]) >= 0.65:
             deduped.append(value)
 
@@ -285,8 +316,14 @@ def _extract_frame_data_url(video_path: Path, timestamp: float, output_path: Pat
     return f"data:image/jpeg;base64,{encoded}"
 
 
-def _normalize_visual_result(parsed: dict, frames: list[dict], duration: float) -> dict:
+def _normalize_visual_result(
+    parsed: dict,
+    frames: list[dict],
+    duration: float,
+    transcript: str,
+) -> dict:
     valid_frames = {index + 1: frame for index, frame in enumerate(frames)}
+    transcript_available = bool((transcript or "").strip())
 
     timeline = []
     for raw in parsed.get("visualTimeline", []) if isinstance(parsed, dict) else []:
@@ -296,24 +333,33 @@ def _normalize_visual_result(parsed: dict, frames: list[dict], duration: float) 
             frame_index = int(raw.get("frameIndex"))
         except Exception:
             continue
+
         frame = valid_frames.get(frame_index)
         if not frame:
             continue
+
         assessment = raw.get("assessment")
-        if assessment not in {"strong", "medium", "weak", "neutral"}:
-            assessment = "neutral"
+        if assessment not in {"strong", "medium", "weak", "neutral", "unknown"}:
+            assessment = "unknown"
+
         risk = raw.get("attentionRisk")
         if risk not in {"low", "medium", "high", "unknown"}:
             risk = "unknown"
+
+        observation = str(raw.get("observation") or "").strip()
+        if not observation:
+            observation = "Observation non déterminable"
+            assessment = "unknown"
+            risk = "unknown"
+
         timeline.append(
             {
                 "frameIndex": frame_index,
                 "timestampSeconds": frame["timestampSeconds"],
                 "timecode": frame["timecode"],
                 "label": str(raw.get("label") or "Moment analysé"),
-                "observation": str(raw.get("observation") or "Observation non déterminable"),
+                "observation": observation,
                 "assessment": assessment,
-                # Le risque d’attention est une estimation créative, jamais une courbe de rétention réelle.
                 "attentionRisk": risk,
                 "evidence": "observed",
             }
@@ -322,30 +368,68 @@ def _normalize_visual_result(parsed: dict, frames: list[dict], duration: float) 
     cta = parsed.get("ctaAnalysis") if isinstance(parsed, dict) else {}
     if not isinstance(cta, dict):
         cta = {}
-    cta_frame = None
+
     try:
         cta_frame = int(cta.get("frameIndex")) if cta.get("frameIndex") is not None else None
     except Exception:
         cta_frame = None
+
     cta_anchor = valid_frames.get(cta_frame) if cta_frame else None
+
     cta_source = cta.get("evidenceSource")
     if cta_source not in {"visual", "audio", "imported", "none"}:
         cta_source = "none"
+
     cta_status = cta.get("status")
     if cta_status not in {"explicit", "implicit", "absent", "unknown"}:
         cta_status = "unknown"
 
+    cta_explanation = str(cta.get("explanation") or "").strip()
+
+    if cta_status == "absent":
+        cta_status = "unknown"
+        cta_source = "none"
+        cta_frame = None
+        cta_anchor = None
+        if transcript_available:
+            cta_explanation = (
+                "Aucun CTA n’a été observé dans les captures analysées ni identifié "
+                "dans la transcription. Son absence visuelle sur l’intégralité de la "
+                "vidéo ne peut pas être prouvée à partir de captures échantillonnées."
+            )
+        else:
+            cta_explanation = (
+                "Aucun CTA visuel n’a été observé dans les captures analysées. "
+                "Le CTA audio n’est pas vérifiable sans transcription, et l’absence "
+                "visuelle sur l’intégralité de la vidéo ne peut pas être prouvée."
+            )
+
+    if cta_source == "audio" and not transcript_available:
+        cta_status = "unknown"
+        cta_source = "none"
+        cta_frame = None
+        cta_anchor = None
+        cta_explanation = (
+            "Le CTA audio n’est pas vérifiable car aucune transcription n’a été fournie."
+        )
+
     priority_fixes = []
-    for index, raw in enumerate(parsed.get("priorityFixes", []) if isinstance(parsed, dict) else [], start=1):
+    for raw in parsed.get("priorityFixes", []) if isinstance(parsed, dict) else []:
         if not isinstance(raw, dict) or len(priority_fixes) >= 3:
+            continue
+        diagnosis = str(raw.get("diagnosis") or "").strip()
+        evidence = str(raw.get("evidence") or "").strip()
+        action = str(raw.get("action") or "").strip()
+        test = str(raw.get("test") or "").strip()
+        if not diagnosis or not evidence or not action:
             continue
         priority_fixes.append(
             {
                 "priority": len(priority_fixes) + 1,
-                "diagnosis": str(raw.get("diagnosis") or ""),
-                "evidence": str(raw.get("evidence") or ""),
-                "action": str(raw.get("action") or ""),
-                "test": str(raw.get("test") or ""),
+                "diagnosis": diagnosis,
+                "evidence": evidence,
+                "action": action,
+                "test": test,
             }
         )
 
@@ -353,9 +437,37 @@ def _normalize_visual_result(parsed: dict, frames: list[dict], duration: float) 
         value = parsed.get(name) if isinstance(parsed, dict) else {}
         return value if isinstance(value, dict) else {}
 
+    on_screen_text = []
+    if isinstance(parsed, dict) and isinstance(parsed.get("onScreenText"), list):
+        seen = set()
+        for item in parsed.get("onScreenText", []):
+            if not isinstance(item, str):
+                continue
+            value = item.strip()
+            if not value:
+                continue
+            key = value.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            on_screen_text.append(value)
+            if len(on_screen_text) >= 12:
+                break
+
+    limitations = [
+        "L’analyse visuelle repose sur des captures horodatées échantillonnées et non sur chaque image de la vidéo."
+    ]
+    if not transcript_available:
+        limitations.append(
+            "Aucune transcription n’a été fournie : les affirmations audio, verbales et le CTA audio restent non vérifiables."
+        )
+
     return {
         "visualAnalysisAvailable": True,
-        "visualAnalysisNote": "Analyse basée sur des captures réelles horodatées de la vidéo. Les risques d’attention sont des estimations créatives, pas des données de rétention plateforme.",
+        "visualAnalysisNote": (
+            "Analyse basée sur des captures réelles horodatées et réparties sur la vidéo. "
+            "Les risques d’attention sont des estimations créatives, pas des données de rétention plateforme."
+        ),
         "durationSeconds": round(duration, 2),
         "frameCount": len(frames),
         "visualTimeline": timeline,
@@ -364,18 +476,14 @@ def _normalize_visual_result(parsed: dict, frames: list[dict], duration: float) 
         "proofAnalysis": safe_object("proofAnalysis"),
         "ctaAnalysis": {
             "status": cta_status,
-            "text": str(cta.get("text") or ""),
+            "text": str(cta.get("text") or "") if cta_status in {"explicit", "implicit"} else "",
             "frameIndex": cta_frame if cta_anchor else None,
             "timestampSeconds": cta_anchor["timestampSeconds"] if cta_anchor else None,
             "timecode": cta_anchor["timecode"] if cta_anchor else "",
             "evidenceSource": cta_source,
-            "explanation": str(cta.get("explanation") or ""),
+            "explanation": cta_explanation,
         },
-        "onScreenText": [
-            str(item).strip()
-            for item in parsed.get("onScreenText", [])
-            if isinstance(item, str) and item.strip()
-        ][:12] if isinstance(parsed, dict) and isinstance(parsed.get("onScreenText"), list) else [],
+        "onScreenText": on_screen_text,
         "priorityFixes": priority_fixes,
         "dataIntegrity": {
             "observed": [
@@ -384,7 +492,10 @@ def _normalize_visual_result(parsed: dict, frames: list[dict], duration: float) 
             "estimated": [
                 "Risque de décrochage / attention à partir du rythme, du contenu et du montage"
             ],
-            "imported": ["Métadonnées publicitaires fournies par la source"],
+            "imported": [
+                "Métadonnées de contexte fournies à l’analyse, lorsqu’elles existent"
+            ],
+            "limitations": limitations,
             "unavailableMetrics": [
                 "CTR réel",
                 "ROAS réel",
@@ -395,35 +506,51 @@ def _normalize_visual_result(parsed: dict, frames: list[dict], duration: float) 
     }
 
 
-def _analyze_visual_frames(frames: list[dict], transcript: str, language: str, context: dict, duration: float) -> dict:
+def _analyze_visual_frames(
+    frames: list[dict],
+    transcript: str,
+    language: str,
+    context: dict,
+    duration: float,
+) -> dict:
+    transcript_available = bool((transcript or "").strip())
     frame_legend = "\n".join(
         f"FRAME {index + 1}: {frame['timecode']} ({frame['timestampSeconds']:.2f}s)"
         for index, frame in enumerate(frames)
     )
+
     prompt = f"""
 You are a senior creative strategist specialized in UGC and performance creative.
 Return the full JSON analysis in {language}.
 
-You are given REAL timestamped frames extracted from one video, plus its real transcript and imported metadata.
+You are given REAL timestamped frames sampled across one video, plus a transcript when available and imported metadata.
 
 STRICT EVIDENCE POLICY:
 - Never invent a CTA, product, person, on-screen text, proof, shot change, metric, performance result or platform data.
 - A visual claim must be supported by one of the supplied frames.
 - An audio/verbal claim must be supported by the transcript.
+- TRANSCRIPT AVAILABLE: {"yes" if transcript_available else "no"}.
+- If TRANSCRIPT AVAILABLE is no, every audio/verbal conclusion must remain unknown. Never say that something is absent from the audio.
 - Imported metadata is not visual evidence. If a CTA exists only in metadata, label evidenceSource as "imported".
-- If the supplied frames do not prove that a CTA is absent from the entire video, use status "unknown", not "absent".
+- The frames are SAMPLES, not every frame in the video. Therefore, if a CTA is not visible in the supplied frames, do NOT conclude it is absent from the entire video. Use status "unknown".
 - You do NOT have CTR, ROAS, conversion rate or a real platform retention curve. Never invent them.
 - attentionRisk is only a CREATIVE ESTIMATE based on visible pacing/information density and must never be described as measured retention.
 - Do not invent confidence percentages.
 - For visualTimeline, use ONLY frameIndex values listed below. Do not create timecodes yourself.
+- Do not use "medium" as a default. Use strong/medium/weak only when the visible evidence clearly supports it; otherwise use "unknown".
+- For attentionRisk, use low/medium/high only when the supplied frames support that estimate; otherwise use "unknown".
+- If readable on-screen text appears in any supplied frame, copy the readable text into onScreenText. Do not mention readable on-screen text elsewhere while leaving onScreenText empty.
+- Never infer exact wording that is not legible. Preserve spelling as actually visible when readable.
 - Give at most 3 priority fixes. Every fix must cite concrete evidence from a frame, transcript, or imported metadata.
+- Do not recommend fixing a CTA merely because no CTA was observed in sampled frames. A CTA correction is allowed only when a real CTA problem is evidenced by a visible CTA, transcript, or imported metadata.
+- Do not recommend adding proof merely because proof was not observed in sampled frames. Use unknown when the sampled evidence is insufficient.
 
 FRAME LEGEND:
 {frame_legend}
 
 REAL TRANSCRIPT:
 <<<TRANSCRIPT>>>
-{transcript}
+{transcript if transcript_available else "[NO TRANSCRIPT PROVIDED]"}
 <<<END TRANSCRIPT>>>
 
 IMPORTED METADATA:
@@ -436,18 +563,18 @@ Return valid JSON only with this exact shape:
       "frameIndex": 1,
       "label": "",
       "observation": "",
-      "assessment": "strong|medium|weak|neutral",
+      "assessment": "strong|medium|weak|neutral|unknown",
       "attentionRisk": "low|medium|high|unknown"
     }}
   ],
   "visualHook": {{
     "observation": "",
-    "assessment": "strong|medium|weak|neutral",
+    "assessment": "strong|medium|weak|neutral|unknown",
     "evidence": "what in the supplied frames/transcript supports this"
   }},
   "pacing": {{
     "observation": "",
-    "assessment": "strong|medium|weak|neutral",
+    "assessment": "strong|medium|weak|neutral|unknown",
     "evidence": ""
   }},
   "proofAnalysis": {{
@@ -491,11 +618,14 @@ Return valid JSON only with this exact shape:
 
     completion = client.chat.completions.create(
         model=os.getenv("OPENAI_VISION_MODEL") or os.getenv("OPENAI_ANALYSIS_MODEL", "gpt-4.1-mini"),
-        temperature=0.2,
+        temperature=0.1,
         messages=[
             {
                 "role": "system",
-                "content": "Evidence-first creative analysis. Never fabricate observations or performance metrics. Return valid JSON only.",
+                "content": (
+                    "Evidence-first creative analysis. Never fabricate observations, "
+                    "absence claims, audio claims or performance metrics. Return valid JSON only."
+                ),
             },
             {"role": "user", "content": content},
         ],
@@ -507,7 +637,8 @@ Return valid JSON only with this exact shape:
         parsed = json.loads(raw)
     except Exception:
         parsed = {}
-    return _normalize_visual_result(parsed, frames, duration)
+
+    return _normalize_visual_result(parsed, frames, duration, transcript)
 
 
 def _run_visual_analysis_from_path(
