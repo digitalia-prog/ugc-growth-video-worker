@@ -510,6 +510,47 @@ Return valid JSON only with this exact shape:
     return _normalize_visual_result(parsed, frames, duration)
 
 
+def _run_visual_analysis_from_path(
+    video_path: Path,
+    tmpdir: str,
+    transcript: str,
+    language: str,
+    context: dict,
+) -> dict:
+    duration = _probe_duration(video_path)
+    timestamps = _detect_scene_timestamps(video_path, duration)
+
+    frames = []
+    frame_dir = Path(tmpdir) / "visual-frames"
+    frame_dir.mkdir(exist_ok=True)
+    for index, timestamp in enumerate(timestamps, start=1):
+        frame_path = frame_dir / f"frame-{index:02d}.jpg"
+        data_url = _extract_frame_data_url(video_path, timestamp, frame_path)
+        if not data_url:
+            continue
+        frames.append(
+            {
+                "timestampSeconds": round(timestamp, 3),
+                "timecode": _format_timecode(timestamp),
+                "dataUrl": data_url,
+            }
+        )
+
+    if not frames:
+        raise HTTPException(
+            status_code=422,
+            detail="Aucune image exploitable n’a pu être extraite de la vidéo",
+        )
+
+    return _analyze_visual_frames(
+        frames=frames,
+        transcript=transcript or "",
+        language=language or "French",
+        context=context or {},
+        duration=duration,
+    )
+
+
 @app.post("/visual-analyze")
 def visual_analyze(payload: VisualAnalysisRequest):
     if not payload.url:
@@ -517,37 +558,46 @@ def visual_analyze(payload: VisualAnalysisRequest):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         video_path = _download_video_for_visuals(payload.url, tmpdir)
-        duration = _probe_duration(video_path)
-        timestamps = _detect_scene_timestamps(video_path, duration)
+        return _run_visual_analysis_from_path(
+            video_path=video_path,
+            tmpdir=tmpdir,
+            transcript=payload.transcript,
+            language=payload.language,
+            context=payload.context,
+        )
 
-        frames = []
-        frame_dir = Path(tmpdir) / "visual-frames"
-        frame_dir.mkdir(exist_ok=True)
-        for index, timestamp in enumerate(timestamps, start=1):
-            frame_path = frame_dir / f"frame-{index:02d}.jpg"
-            data_url = _extract_frame_data_url(video_path, timestamp, frame_path)
-            if not data_url:
-                continue
-            frames.append(
-                {
-                    "timestampSeconds": round(timestamp, 3),
-                    "timecode": _format_timecode(timestamp),
-                    "dataUrl": data_url,
-                }
-            )
 
-        if not frames:
-            raise HTTPException(
-                status_code=422,
-                detail="Aucune image exploitable n’a pu être extraite de la vidéo",
-            )
+@app.post("/visual-analyze-upload")
+async def visual_analyze_upload(
+    file: UploadFile = File(...),
+    transcript: str = Form(""),
+    language: str = Form("French"),
+    context: str = Form("{}"),
+):
+    # Endpoint de test/production pour les fichiers vidéo envoyés directement.
+    # Il permet de valider le moteur visuel sans dépendre des protections anti-bot
+    # de YouTube, TikTok ou d'un hébergeur tiers.
+    try:
+        parsed_context = json.loads(context or "{}")
+        if not isinstance(parsed_context, dict):
+            parsed_context = {}
+    except Exception:
+        parsed_context = {}
 
-        return _analyze_visual_frames(
-            frames=frames,
-            transcript=payload.transcript or "",
-            language=payload.language or "French",
-            context=payload.context or {},
-            duration=duration,
+    with tempfile.TemporaryDirectory() as tmpdir:
+        suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
+        input_path = Path(tmpdir) / f"visual-upload{suffix}"
+        await save_upload(file, input_path)
+
+        if not input_path.exists() or input_path.stat().st_size == 0:
+            raise HTTPException(status_code=422, detail="Fichier vidéo vide")
+
+        return _run_visual_analysis_from_path(
+            video_path=input_path,
+            tmpdir=tmpdir,
+            transcript=transcript,
+            language=language,
+            context=parsed_context,
         )
 
 
