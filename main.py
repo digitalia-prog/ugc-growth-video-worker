@@ -231,9 +231,12 @@ def _detect_scene_timestamps(video_path: Path, duration: float) -> list[float]:
     if end <= 0.3:
         return [max(0.0, end / 2)]
 
+    # VISUAL_ENGINE_V13_RELIABILITY
+    # Viser environ une capture toutes les 4 secondes sur les vidéos courtes,
+    # tout en respectant la limite globale de frames.
     regular_count = min(
         MAX_VISUAL_FRAMES,
-        max(5, int(end // 15.0) + 1),
+        max(5, int(end / 4.0) + 2),
     )
 
     if regular_count <= 1:
@@ -437,6 +440,84 @@ def _normalize_visual_result(
         value = parsed.get(name) if isinstance(parsed, dict) else {}
         return value if isinstance(value, dict) else {}
 
+    proof = safe_object("proofAnalysis")
+    proof_status = proof.get("status")
+    if proof_status not in {"observed", "not_observed", "unknown"}:
+        proof_status = "unknown"
+
+    # Des captures échantillonnées ne peuvent pas prouver l'absence de preuve
+    # sur l'intégralité d'une vidéo.
+    if proof_status == "not_observed":
+        proof_status = "unknown"
+        proof = {
+            "status": "unknown",
+            "observation": (
+                "Aucune preuve n’a été observée dans les captures analysées. "
+                "Ces captures étant échantillonnées, l’absence de preuve sur "
+                "l’intégralité de la vidéo ne peut pas être confirmée."
+            ),
+            "evidenceSource": "visual",
+        }
+    else:
+        proof = dict(proof)
+        proof["status"] = proof_status
+
+    # Si le modèle renvoie CTA inconnu sur la seule base des captures sans
+    # CTA concret, ne pas présenter 'visual' comme une preuve de CTA.
+    if (
+        cta_status == "unknown"
+        and cta_source == "visual"
+        and not str(cta.get("text") or "").strip()
+        and not cta_anchor
+    ):
+        cta_source = "none"
+        if not cta_explanation:
+            cta_explanation = (
+                "Aucun CTA n’a été observé dans les captures analysées. "
+                "Son statut reste inconnu sur l’intégralité de la vidéo."
+            )
+
+    # Filtrer les recommandations qui contredisent le niveau de preuve.
+    filtered_priority_fixes = []
+    cta_terms = (
+        "cta",
+        "appel à l’action",
+        "appel a l'action",
+        "appel à l'action",
+        "call to action",
+    )
+    proof_terms = (
+        "preuve",
+        "proof",
+        "témoignage",
+        "temoignage",
+        "démonstration",
+        "demonstration",
+    )
+
+    for fix in priority_fixes:
+        haystack = " ".join(
+            [
+                fix.get("diagnosis", ""),
+                fix.get("evidence", ""),
+                fix.get("action", ""),
+            ]
+        ).casefold()
+
+        if cta_status == "unknown" and any(term.casefold() in haystack for term in cta_terms):
+            continue
+
+        if proof_status == "unknown" and any(term.casefold() in haystack for term in proof_terms):
+            continue
+
+        fix = dict(fix)
+        fix["priority"] = len(filtered_priority_fixes) + 1
+        filtered_priority_fixes.append(fix)
+        if len(filtered_priority_fixes) >= 3:
+            break
+
+    priority_fixes = filtered_priority_fixes
+
     on_screen_text = []
     if isinstance(parsed, dict) and isinstance(parsed.get("onScreenText"), list):
         seen = set()
@@ -473,7 +554,7 @@ def _normalize_visual_result(
         "visualTimeline": timeline,
         "visualHook": safe_object("visualHook"),
         "pacing": safe_object("pacing"),
-        "proofAnalysis": safe_object("proofAnalysis"),
+        "proofAnalysis": proof,
         "ctaAnalysis": {
             "status": cta_status,
             "text": str(cta.get("text") or "") if cta_status in {"explicit", "implicit"} else "",
