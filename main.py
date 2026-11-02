@@ -94,6 +94,31 @@ def extract_audio_for_transcription(input_path: Path, tmpdir: str) -> Path:
     return output_path
 
 
+def transcribe_uploaded_media_with_segments(input_path: Path, tmpdir: str) -> dict:
+    """Obtain genuinely timestamped Whisper segments; preserve old transcript contract."""
+    audio_path = extract_audio_for_transcription(input_path, tmpdir)
+    with audio_path.open("rb") as audio_file:
+        result = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+        )
+    segments = []
+    for part in (getattr(result, "segments", None) or [])[:300]:
+        def field(name, fallback=None):
+            return part.get(name, fallback) if isinstance(part, dict) else getattr(part, name, fallback)
+        try:
+            start = float(field("start", -1))
+            end = float(field("end", -1))
+        except (ValueError, TypeError):
+            continue
+        content = str(field("text", "") or "").strip()
+        if 0 <= start <= end and content:
+            segments.append({"start": round(start, 2), "end": round(end, 2), "text": content[:600]})
+    return {"transcript": getattr(result, "text", "") or "", "transcriptSegments": segments}
+
+
 def transcribe_uploaded_media(input_path: Path, tmpdir: str) -> str:
     audio_path = extract_audio_for_transcription(input_path, tmpdir)
 
@@ -317,6 +342,73 @@ def _extract_frame_data_url(video_path: Path, timestamp: float, output_path: Pat
         return ""
     encoded = base64.b64encode(output_path.read_bytes()).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}"
+
+
+# VIDEO_INTELLIGENCE_V16 — technical signal is NOT a platform performance metric.
+V16_TECHNICAL_LIMIT_SECONDS = 180
+V16_FRAME_WIDTH = 48
+V16_FRAME_HEIGHT = 27
+
+
+def _technical_video_intelligence(video_path: Path, duration: float) -> dict:
+    """Measure pixel changes on grayscale frames sampled at 1 Hz; no ML inference."""
+    info = {"version": "1.6", "samplingHz": 1, "samples": [], "coverageSeconds": 0,
+            "durationSeconds": round(duration, 2), "videoWidth": None, "videoHeight": None,
+            "frameRate": None, "hasAudio": None, "meanChangePercent": None,
+            "limitations": ["Variation visuelle mesurée sur des images à 1 Hz, sans interprétation sémantique par seconde.",
+                            "Les scores ne représentent ni l'attention ni la rétention des spectateurs."]}
+    try:
+        probe = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "stream=codec_type,width,height,avg_frame_rate",
+            "-of", "json", str(video_path),
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30, text=True)
+        streams = json.loads(probe.stdout).get("streams", [])
+        video_stream = next((s for s in streams if s.get("codec_type") == "video"), {})
+        info["videoWidth"] = int(video_stream.get("width") or 0) or None
+        info["videoHeight"] = int(video_stream.get("height") or 0) or None
+        info["hasAudio"] = any(s.get("codec_type") == "audio" for s in streams)
+        rate = str(video_stream.get("avg_frame_rate") or "")
+        if "/" in rate:
+            num, den = rate.split("/", 1)
+            fps = float(num) / float(den) if float(den) else 0
+        else:
+            fps = float(rate) if rate else 0
+        info["frameRate"] = round(fps, 2) if 0 < fps < 1000 else None
+    except (ValueError, TypeError, subprocess.SubprocessError, OSError, KeyError):
+        info["limitations"].append("Certaines métadonnées vidéo sont indisponibles.")
+
+    coverage = min(max(0, duration), V16_TECHNICAL_LIMIT_SECONDS)
+    if coverage <= 0:
+        info["limitations"].append("Durée de la vidéo non déterminée.")
+        return info
+    if duration > V16_TECHNICAL_LIMIT_SECONDS:
+        info["limitations"].append("Mesures techniques limitées aux 180 premières secondes de la vidéo.")
+
+    try:
+        process = subprocess.run([
+            "ffmpeg", "-v", "error", "-t", str(coverage), "-i", str(video_path),
+            "-an", "-vf", f"fps=1,scale={V16_FRAME_WIDTH}:{V16_FRAME_HEIGHT},format=gray",
+            "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=120)
+        raw = process.stdout
+        frame_bytes = V16_FRAME_WIDTH * V16_FRAME_HEIGHT
+        count = min(len(raw) // frame_bytes, V16_TECHNICAL_LIMIT_SECONDS)
+        previous = None
+        changes = []
+        for i in range(count):
+            current = raw[i * frame_bytes: (i+1) * frame_bytes]
+            change = round(100 * sum(abs(a-b) for a, b in zip(current, previous)) /
+                           (255 * frame_bytes), 2) if previous is not None else None
+            info["samples"].append({"second": i, "changePercent": change})
+            if change is not None:
+                changes.append(change)
+            previous = current
+        info["coverageSeconds"] = count
+        if changes:
+            info["meanChangePercent"] = round(sum(changes)/len(changes), 2)
+    except (subprocess.SubprocessError, OSError) as exc:
+        info["limitations"].append("Mesure par seconde indisponible : extraction FFmpeg impossible.")
+    return info
 
 
 def _normalize_visual_result(
@@ -754,13 +846,17 @@ def _run_visual_analysis_from_path(
             detail="Aucune image exploitable n’a pu être extraite de la vidéo",
         )
 
-    return _analyze_visual_frames(
+    result = _analyze_visual_frames(
         frames=frames,
         transcript=transcript or "",
         language=language or "French",
         context=context or {},
         duration=duration,
     )
+    # Independent FFmpeg metadata and 1 Hz variation measurements.
+    # Visual semantics still come ONLY from the timestamped AI frame samples.
+    result["videoIntelligenceV16"] = _technical_video_intelligence(video_path, duration)
+    return result
 
 
 @app.post("/visual-analyze")
@@ -978,7 +1074,12 @@ async def upload_transcribe(file: UploadFile = File(...)):
 
         try:
             await save_upload(file, input_path)
-            transcript = transcribe_uploaded_media(input_path, tmpdir)
+            try:
+                timed = transcribe_uploaded_media_with_segments(input_path, tmpdir)
+            except Exception:
+                # Keep the existing working transcription path in case timestamp mode fails.
+                timed = {"transcript": transcribe_uploaded_media(input_path, tmpdir), "transcriptSegments": []}
+            transcript = timed["transcript"]
 
             if not transcript.strip():
                 raise HTTPException(status_code=422, detail="Transcript vide")
@@ -988,6 +1089,7 @@ async def upload_transcribe(file: UploadFile = File(...)):
                 "noStorage": True,
                 "filename": safe_name,
                 "transcript": transcript,
+                "transcriptSegments": timed["transcriptSegments"],
             }
         except HTTPException:
             raise
